@@ -1,0 +1,538 @@
+---
+title: "HMDA-zillow-merge-walkthrough"
+author: "Connor Lennon"
+date: "8/26/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(pacman)
+
+p_load(
+  broom, tidyverse,
+  ggplot2, ggthemes, ggforce, ggridges, cowplot,
+  latex2exp, viridis, extrafont, gridExtra, plotly, ggformula,
+  kableExtra, snakecase, janitor,
+  data.table, dplyr,
+  lubridate, knitr, future, furrr,
+  MASS, estimatr, FNN, caret, parsnip,
+  huxtable, here, magrittr, parallel, hmisc
+)
+
+p_load(gmodels,
+  gtools,
+  RPostgres,
+  sqldf,
+  readr,
+  RODBC,
+  ggmap,
+  DT,
+  rgdal,
+  raster,
+  phonics,
+  UScensus2000tract,
+  tmap,
+  XML,
+  sf,
+  sp,
+  rgeos,
+  spatialEco,
+  tigris,
+  magrittr,
+  rgdal,
+  maptools,
+  dplyr,
+  dbplyr,
+  lubridate,
+  jsonlite,
+  httr,
+  ggplot2,
+  data.table,
+  here,
+  stringi,
+  stringr)
+
+wrapper <- function(x, ...) paste(strwrap(x, ...), collapse = "\n")
+
+# Define colors
+red_pink   = "#e64173"
+turquoise  = "#20B2AA"
+orange     = "#FFA500"
+red        = "#fb6107"
+blue       = "#3b3b9a"
+green      = "#8bb174"
+grey_light = "grey70"
+grey_mid   = "grey50"
+grey_dark  = "grey20"
+purple     = "#6A5ACD"
+slate      = "#314f4f"
+met_slate <- "#272822" #metropolis font
+
+theme_market <- theme_bw() + theme(
+  axis.line = element_line(color = slate),
+  panel.grid = element_blank(),
+  rect = element_blank(),
+  strip.text = element_blank(),
+  text = element_text(color = slate, size = 12),
+  axis.title.x = element_text(hjust = 1, size = 12),
+  axis.title.y = element_text(hjust = 1, angle = 0, size = 12),
+  axis.ticks = element_blank()
+)
+
+xs = seq(0, 10, by = .1)
+ys = xs
+data = expand.grid(xs, ys)
+
+utility = function(data){
+  data$utils = (data[,1]^.5)*(data[,2]^.5)
+  return(data)
+}
+
+utils = data.frame(
+   utility(data)
+)
+
+names(utils) = c('GoodA', 'GoodB', 'Utility')
+
+sampplot = ggplot(data = utils, aes(x=Var1,y=Var2, z = utils, color = Var1)) + stat_contour(bins = 5, aes(z = utils, colour = ..level..)) + theme_market + scale_color_binned("utils") + scale_colour_viridis_b(option = "plasma")
+
+# Knitr options
+opts_chunk$set(
+  comment = "#>",
+  fig.align = "center",
+  fig.height = 7,
+  fig.width = 10.5,
+  warning = F,
+  message = F
+)
+opts_chunk$set(dev = "svg")
+options(device = function(file, width, height) {
+  svg(tempfile(), width = width, height = height)
+})
+options(knitr.table.format = "html")
+zillowdbfilepath = '/Volumes/G-DRIVE-mobile-SSD-R-Series/ZTrans/sorting_wui.sqlite'
+
+hmda_database = dbConnect(Postgres(), host = 'localhost', dbname = 'hmda', 
+    password = 'sortingproject', user = 'postgres')
+database <- dbConnect(RSQLite::SQLite(), zillowdbfilepath)
+
+pinfo = tbl(database, 'propInfo')
+zillowSQL1_con = tbl(database, 'Main')
+maintranstab = tbl(database, 'largetransaction')
+zilint = left_join(maintranstab, pinfo, by = 'TransId')
+zilint = zilint %>% dplyr::filter(DataClassStndCode %in% c('D', 'H'))
+zilint1 = left_join(zilint, tbl(database, 'MainAssmt'), by = 'ImportParcelID')
+zilint1 = left_join(zilint1, tbl(database, 'bldg'), by = 'RowID')
+```
+
+## Zillow Transactions Data
+
+In order to wrap our heads around this procedure, it's important we understand our source datasets and how they are used to get the demographic & income data merged to coordinate-level home loans. 
+
+As is set up in the repo, Zillow transactions are held in a large sqlite database that allows a researcher to build complex queries and only read data into memory that we actually will use. This is important for data that is as large as the ZTRAX is.
+
+ZTRAX transactions contain essentially every transfer of a deed you can think of, including mortgages, sales, foreclosures and transfers. Because deed transactions is the main locus of the data, it is organized around transfer IDs, which identify a unique transfer of home deed.
+
+Let's look at this data.
+
+```{r maintable}
+database = database <- dbConnect(RSQLite::SQLite(), zillowdbfilepath)
+maintranstab = tbl(database, 'largetransaction')
+maintranstab %>% mutate(date = as.Date(RecordingDate)) %>% filter(date == 2003) %>% head() %>% dplyr::select(c(SalesPriceAmount, LoanAmount, TransId, DataClassStndCode, County, FIPS, RecordingDate, 
+                                            DocumentDate, DocumentTypeStndCode))
+```
+Some things to note! 
+
+**1)** Some columns have a loan amount but no sale price, and some have a sale price but no loan amount. 
+
+**2.)** The *Recording Date* is not necessarily the same as the *Document Date* and thus it's not totally clear whether certain property transactions should be shuttled into 2002 or 2003 here, and we have some limited geographic information about the transaction. This will come up a bit later.
+
+## HMDA
+
+HMDA (specifically the LAR) data contains all loans (in required regions) and demographic data associated with the lendees. This data is linked to lenders, and the originally stated goal is to gain insight into possible discrimination by lenders against minority or otherwise disadvantaged populations for home loans.
+
+Let's take a look at our 2003 hmda data. In order to be more flexible in view, we use a Postgresql database here, with a schema. this complicates the access procedure slightly in R. In practice, you'll have a password, database name, and a username to access this data.
+
+This data is fundamentally focused around loans, and so it's primary identifier is a sequence number (for most years.) However, the procedure for reporting this data also informs the data itself.
+
+HMDA data is essentially created by the lender in order to give out any sort of home loan to a person or company that seeks to produce a building. This means that the data inside of the HMDA tables is often strangely categorized in service of convenience for the lender who bears the burden of reporting the information. This will come up later. For now, let's take a peek at 2003's HMDA LAR data.
+
+```{r, HMDA}
+#each table in the HMDA database is keyed to hmda_<year>
+tbl_name = 'lar_2003'
+hmda = tbl(hmda_database, in_schema('hmda_public',tbl_name))
+hmda %>% dplyr::select(c(respondent_id, agency_code, activity_year, 
+                         loan_amount, applicant_race, applicant_sex, 
+                         income,sequence_num)) %>% head()
+```
+As you can see, the date of the loan is most fine-grained at the year level. Additionally, you will notice that **loan_amount** is keyed in thousands of dollars. This means we have a rough estimate of the size of the loan, but not a precise dollar value.
+
+Our first two columns here create our unique identifier for the HMDA data - the reason for this is for simplicity for the lender. Rather than have lenders track their own respondent_id, which puts data entry errors in the hands of thousands of lenders across the US, the government agency who receives the loan HMDA paperwork generates one for them.
+
+Of course, this procedure is not unified across agencies, so in order to guarantee a unique id, you can create a new **proper** respondent id identifier to uniquely identify a lender by simply taking *agency_code* and concatenating it to *respondent_id*. This looks like:
+
+```{r, HMDA2}
+#each table in the HMDA database is keyed to hmda_<year>
+tbl_name = 'lar_2003'
+hmda = tbl(hmda_database, in_schema('hmda_public',tbl_name))
+hmda %>% mutate(respondent_id_prop = str_c(agency_code, respondent_id)) %>% head() %>% dplyr::select(respondent_id_prop)
+```
+This can serve as a way of identifying an **institution or individual** that provides a loan without identifying the lender directly.
+
+Let's take a peak at the spatial data the HMDA has stored.
+
+```{r}
+hmda %>% dplyr::select(c(respondent_id, state_code, county_code, census_tract)) %>% head()
+```
+
+Here, we have no geographic identifiers as fine as lat-long points, but we do have census tracts that we can use to pin down roughly where each loan took place. However, each tract is geographically small enough that within a tract, it is unlikely to have out two loans given out that are identical in magnitude. We can use this to match the precisely located zillow data to the less precisely located HMDA data.
+
+Now, we can talk about the overarching strategy to merge our zillow sales data (which contains numerous useful hedonic measurements, along with better spatial detail than the HMDA) to the HMDA dataset.
+
+## Strategy and Merge 1
+
+In order to produce a large number of matched transactions in California, we need to have a good way of identifying who gives out the loans in the HMDA dataset. However, that information is partially hidden behind a respondent_id number, and even if it weren't - we can't say for certain that the name reported by the HMDA would match the name reported in the zillow transaction data. So we'll have to derive a list of lender names for the HMDA 'respondent IDs'.
+
+In full, we will produce three messy merges that we can combine at the end for a hopefully representative and comprehensive final product. These are:
+
+**1.)** Merge zillow based on unique combinations of loan-amount & census tract to HMDA that are unique in the same way
+
+**2.)** Merge zillow based on loan-mount, census tract and lender to the same information from the HMDA.
+
+**3.)** The same as approach 2, but using a soundex 'sounds like' approximation of lender name to account for potential typos.
+
+So we start with the easiest data to match: we will find a list of zillow transactions in a given census tract and year that feature a unique loan amount. That is, in the zillow database, we will filter down every transaction featuring a loan where the loan amount is not seen in that year and tract. This will prevent us from mismatching our data on HMDA information. We'll call this **merge 1**.
+
+We then find similarly unique HMDA transactions, and match these two pared-down datasets to one another. This is fairly simple, but requires some work to get there. Our first goal is to merge and coalesce the necessary information (plus some extra columns for sanity checks) from a set of tables contained in the zillow database. Let's do this process for both 2003 and 2017 to get a sense of how the data (and what's required to merge it) changes over time.
+
+We will need a geographic identifier (lat-long), lender information, dates, and also columns to merge the zillow tables.
+
+### Zillow Processing
+
+```{r}
+#the nice thing about dbs is that you can build complex views without having to read the entire table into memory. This means we essentially can do a lot of the simple filters that substantially reduce data size before the data ever touches memory.
+
+#join property information to transactions main, filter only those transactions where a deed is in fact transfered, join to assessment data and building data.
+```
+
+```{r}
+zillowSQL = zilint1 %>% dplyr::select(SalesPriceAmount, PropertyAddressLatitude, 
+                                         LoanAmount, PropertyAddressLongitude, 
+                                         ImportParcelID, TransId, LenderDBAName, 
+                                         LenderIDStndCode, LenderName, 
+                                         InitialInterestRate, FIPS, RecordingDate, DocumentDate) %>%
+                                              mutate(date = as.Date(RecordingDate)) %>% filter(date == 2003) %>%
+  collect() %>% 
+  as.data.table()
+
+#for more complex logical expressions, doing this in memory speeds up processes. Filter out observations that have no sale price or loan amount.
+zillow <- zillowSQL[which(zillowSQL$PropertyAddressLatitude != "NA" & !is.na(zillowSQL$PropertyAddressLatitude) &
+                                       ((zillowSQL$SalesPriceAmount!= "NA" & !is.na(zillowSQL$SalesPriceAmount) &
+                                           zillowSQL$SalesPriceAmount>= 1000) & 
+                                          (zillowSQL$LoanAmount > 0 
+                                           & zillowSQL$LoanAmount != "NA" & !is.na(zillowSQL$LoanAmount)))) , ]
+
+```
+
+Now, recall that HMDA data on loan amounts is reported in thousands of dollars. We need a zillow loan amount equivalent against which we can match the HMDA loan_amount column.
+
+```{r}
+zillow$loan_amount = round(zillow$LoanAmount/1000)
+```
+
+Now, the zillow data does in fact feature the same spatial data as the HMDA that we could match with (ie, tract, state and county) but the problem is that those tracts and counties are up-to-date as of the transaction time.
+
+The HMDA data are not in fact reporting current (as of the year) census tract information. Because data in the HMDA database are reported by indvidual lenders, the lenders are also responsible for reporting which census tract the home for which the loan was furnished resides. In order to simplify this process, the HMDA data uses census tracts for several years after the census bureau no longer uses those tracts. That means that the zillow data has to be placed inside of a varierty of census tracts to be able to spatially match it correctly, depending on the year of the loan. So let's download the relevant historic census tracts.
+
+```{r}
+#1990 tracts used through 2003 in HMDA reporting, but uses only less-well-defined tigris definitions, unfortunately  
+#tracts1990 <- tracts('CA', county = NULL, cb = TRUE, year = 1990, refresh = TRUE)
+
+#2015 tracts are used for 2017 and onwards
+
+tracts2015 <- tracts('CA', county = NULL, cb = FALSE, year = 2015, refresh = TRUE)
+
+## 2000 census tracts and 2010 census tracts are also required for years between 2002 and 2017
+
+tracts2000 <- tracts('CA', county = NULL, cb = FALSE, year = 2000, refresh = TRUE) #we'll use 2000 to transform our CRS
+
+census.CRS <- st_crs(tracts2000)
+
+tracts2015 = st_transform(tracts2015, census.CRS)
+
+zdf = st_as_sf(zillow, coords = c("PropertyAddressLongitude", "PropertyAddressLatitude"), agr = "constant", crs = census.CRS)
+
+cord.UTM <- st_transform(zdf, census.CRS)
+```
+
+To get our data's HMDA-friendly census tract information, we need to to do a within join using sf.
+
+```{r}
+zillow_tract <- st_join(cord.UTM, tracts2000, join = st_within)
+zillow_tract$id_number <- paste(zillow_tract$COUNTYFP, zillow_tract$TRACTCE, sep = '')
+# Add decimal to make mergeable to HMDA data
+zillow_tract$id_number <- sub("([[:digit:]]{2,2})$", ".\\1", zillow_tract$id_number)
+```
+
+Now that we have a tract (ID number) and loan amount, we need to identify observations that contain precisely one combination of id number and loan amount. We can use data.table tools to do this quickly and efficiently.
+
+```{r}
+#build a count data.table, merge it to original data, filter s.t. n == 1.
+zillow3_filt = setDT(zillow_tract)[, .(n = .N), by = .(id_number,loan_amount)]
+zillow3 = merge(zillow_tract,zillow3_filt, by =c('id_number','loan_amount')) %>% filter(n == 1)
+```
+
+We will use this `zillow3` object to merge to our HMDA data. First though, we need to process the HMDA data.
+
+### HMDA processing
+
+The year of data we are looking at is 2003, meaning our respondent ID is still in use. In 2018 - this gets replaced with a `lei` column which cannot be compared with respondent ID. We'll be using this information at the end of merge1 to produce merge2.
+
+```{r}
+hmda = tbl(hmda_database, in_schema('hmda_public','lar_2003')) %>% collect()
+
+#using sequence number can allow us to check if a single loan is matched to multiple rows in the zillow data
+hmda$sequence_num %<>% parse_number()
+
+hmda %<>% mutate(agency_code = ifelse(is.na(agency_code), '023', agency_code))
+#build an identifiable column for respondent id.
+hmda %<>% mutate(respondent_id_prop = str_c(agency_code, respondent_id, sep = ''))
+
+#produce an 'id_number' against which we can match zillow's tract
+hmda$county_code <- parse_number(hmda$county_code)
+      
+hmda$county_code <- paste(formatC(hmda$county_code, width = 3, flag = "0"), sep = "")
+      
+hmda$county_code <- as.character(hmda$county_code)
+
+hmda$id_number <- paste0(hmda$county_code, hmda$census_tract)
+
+#turn loan amount into a numeric and generate a LoanAmount column that ~ zillow's
+hmda %<>% mutate(loan_amount = as.numeric(loan_amount)) %>% mutate(LoanAmount = loan_amount*1000)
+
+hmda <- hmda[which(hmda$id_number != 'NA'
+                         & !is.na(hmda$LoanAmount)), ]
+```
+
+Like zillow, we need to find unique loans within a given tract, so let's use DT to do some work for us.
+
+```{r}
+count.hmda <- setDT(hmda)[, .(n = .N), by = c('id_number', 'loan_amount')]
+      
+      
+hmda2 <- merge(hmda, count.hmda,
+                by.x = c("id_number", "loan_amount"),
+                by.y = c("id_number", "loan_amount"))
+
+hmda2 <- hmda2[which(hmda2$n == 1), ] %>% as.data.table()
+```
+
+### Merge 1
+
+Now, we simply need to merge the dfs.
+
+```{r}
+merge12 = merge(zillow3, hmda2, 
+                      by.x = c("id_number", "loan_amount"),
+                      by.y = c("id_number", "loan_amount"), .keep_all = TRUE)
+
+## in practice I match against 1.) loan_amount, LoanAmount, loan_amount ceiling and loan_amount floor, then find unique matches to account for differences in data entry between lenders.
+
+merge12 %>% head()
+
+nrow(merge12)
+```
+
+## Merge 2
+
+However, we actually gained some information here. Because of the merge, we actually have zillow-friendly identifiers for the respondent_id. We can use these to build a dictionary of lendernames to respondent_ids and then use those to populate a lendername column in the HMDA dataset.
+
+```{r}
+lendername <- subset(merge12, select = c(LenderName, respondent_id_prop, activity_year)) %>% as.data.table()
+```
+
+I use this information to populate a comprehensive lendername dictionary, that can be referenced by year. I do this (different from past approaches) because unique identifications of respondent_id do not expire (though they become less accurate through mergers/acquisitions/closing of doors etc.) in other years. Rather than recreating the entire dictionary in this document, instead we'll use a disk-stored version of this object.
+
+```{r}
+lendername_dictionary = readRDS(here('lendername_dict.dta'))
+```
+
+Because matches from years that are further away add little use, but massively increase compute time, we will have priority matching on the current year (2003) and then the year following the loan (2004) followed by the prior year (2002). Beyond that, returns on investment are minimal. There is no in-built dictionary for R, but we can approximate the function of one using data.tables.
+
+**NOTE: here I am only looking at current year, and half of found institutions across a subset of our dataset. RStudio and Rmarkdown overwhelm memory when trying to do this in full**
+```{r}
+`%nin%` = Negate(`%in%`)
+
+lendername = lendername_dictionary %>% filter(activity_year == 2003) %>% head(round(nrow(lendername)/2))
+
+#sample down to 100000 loans
+hmda = hmda[sample(.N,100000)]
+hmda[setkey(lendername[,.(LenderName, respondent_id_prop)],respondent_id_prop), on = 'respondent_id_prop', LenderName := i.LenderName] %>% head()
+hmda_sameyr = hmda %>% filter(!is.na(LenderName))
+
+hmda_temp = hmda_sameyr #normally this would be an rbind of all three year sets.
+
+hmda3 <- hmda_temp[which(hmda_temp$id_number != 'NA' & !is.na(hmda_temp$id_number) & 
+                              hmda_temp$LoanAmount != 'NA' & !is.na(hmda_temp$LoanAmount) &
+                              hmda_temp$LenderName != "NA" & !is.na(hmda_temp$LenderName) & (hmda_temp$state_code == '06'|hmda_temp$state_code == 'CA') & hmda_temp$county_code != 'NA' & hmda_temp$census_tract != 'NA' & !is.na(hmda_temp$census_tract)), ]
+```
+
+Some quick manipulation of the zillow data to make it easier to work with
+
+```{r}
+zillow4<- setDT(zillow_tract)[, .(n = .N), by = c('id_number', 'loan_amount', 'LenderName')] %>% filter(n == 1) %>% filter(!is.na(LenderName))
+
+zillow4$loan_amount %<>% as.numeric()
+```
+
+### Merge 2.
+
+```{r}
+merge2 <- merge(zillow4, 
+                dplyr::select(hmda3, c(id_number, loan_amount, LenderName, sequence_num, respondent_id_prop)),
+                      by.x = c("id_number", "loan_amount", "LenderName"),
+                      by.y = c("id_number", "loan_amount", "LenderName"))
+
+head(merge2)
+```
+
+## Merge 3
+
+This is identical to merge two, but with fuzzy lender names. The way the original paper approaches this is by using soundex to produce syllabic matching on the names. Luckily this is fairly straightforward to do in R.
+
+```{r}
+hmda3a = hmda3 %>% mutate(LenderName2 = mra_encode(stri_replace_all_fixed(LenderName, ' ', '')))
+hmda3a$LenderName2 <- refinedSoundex(hmda3a$LenderName2, maxCodeLen = 4L)
+hmda3a = hmda3a[which(hmda3a$id_number != 'NA' & !is.na(hmda3a$id_number) &
+                              hmda3a$LoanAmount != 'NA' & !is.na(hmda3a$LoanAmount) &
+                              hmda3a$LenderName2 != "NA" & !is.na(hmda3a$LenderName2)) , ]
+hmda3a$loan_amount %<>% as.numeric()
+      #hmda3a$LenderName <- NULL
+zillow2 = zillow_tract %>% mutate(LenderName2 = mra_encode(stri_replace_all_fixed(LenderName, ' ', '')))
+zillow2$LenderName2 <- refinedSoundex(zillow2$LenderName2,  maxCodeLen = 4L)
+      
+      #zillow2$LenderName <- NULL
+      
+      # Do the other stuff
+count.hmda.merge3 <- setDT(hmda3a)[, .(n = .N), by = c('id_number', 'loan_amount', 'LenderName2')]
+count.hmda.merge3$loan_amount %<>% as.numeric()
+
+hmda4 <- merge(hmda3a, count.hmda.merge3, 
+                     by = c("id_number", "loan_amount", "LenderName2"))
+
+hmda4 = hmda4[which(hmda3$n == 1), ]
+
+hmda4 = hmda4[which(hmda4$id_number != 'NA' & !is.na(hmda4$id_number) &
+                              hmda4$LoanAmount != 'NA' & !is.na(hmda4$LoanAmount) &
+                              hmda4$LenderName2 != "NA" & !is.na(hmda4$LenderName2)), ]%>% 
+  mutate(loan_amount = as.numeric(loan_amount))
+      
+rm(hmda3a)
+rm(hmda3)
+      
+rm(count.hmda.merge3)
+      
+count.zillow.merge3 <- setDT(zillow2)[, .(n = .N), by = c('id_number', 'LoanAmount', 'LenderName2', 'loan_amount')]
+      
+zillow5 <- merge(zillow2, count.zillow.merge3,
+                       by.x = c("id_number", "loan_amount", "LenderName2"),
+                       by.y = c("id_number", "loan_amount", "LenderName2"))
+      
+zillow5 <- zillow5[which(zillow5$n == 1), ] %>% mutate(loan_amount = as.numeric(loan_amount))
+zillow5$loan_amount %<>% as.numeric()
+hmda4$loan_amount %<>% as.numeric()
+merge3 <- merge(zillow5, dplyr::select(hmda4, c(id_number, loan_amount, LenderName2, sequence_num, respondent_id_prop)) ,
+                      by.x = c("id_number", "loan_amount", "LenderName2"),
+                      by.y = c("id_number", "loan_amount", "LenderName2"))
+```
+
+Done! Generally this third merge picks up on very few (if any) observations.
+
+```{r}
+merge3 %>% head()
+```
+
+# Using 2017 data
+
+HMDA reports have massively changed both what data as well as how that data is reported. As an example -I will reproduce the 2017 merge here.
+
+```{r}
+zillowSQL = zilint1 %>% dplyr::select(SalesPriceAmount, PropertyAddressLatitude, LoanAmount, PropertyAddressLongitude, ImportParcelID, TransId, LenderDBAName, LenderIDStndCode, LenderName, InitialInterestRate, FIPS, RecordingDate, DocumentDate) %>% 
+                                              mutate(date = as.Date(RecordingDate)) %>% filter(date == 2017) %>% collect() %>% as.data.table()
+
+zillow.main <- zillowSQL[which(zillowSQL$PropertyAddressLatitude != "NA" & !is.na(zillowSQL$PropertyAddressLatitude) &
+                                       ((zillowSQL$SalesPriceAmount!= "NA" & !is.na(zillowSQL$SalesPriceAmount) &
+                                           zillowSQL$SalesPriceAmount>= 1000) & 
+                                          (zillowSQL$LoanAmount > 0 
+                                           & zillowSQL$LoanAmount != "NA" & !is.na(zillowSQL$LoanAmount)))) , ]
+
+zillow <- zillow.main[which(zillow.main$PropertyAddressLatitude != "NA"), ]
+zillow <- zillow[which(zillow.main$PropertyAddressLongitude != "NA"), ]
+zillow = as.data.table(zillow)
+zillow <- distinct(zillow,ImportParcelID, SalesPriceAmount, RecordingDate, LoanAmount,
+                         .keep_all = TRUE)
+zillow2 = zillow
+      
+# Make loan amount comparable to HMDA syntax
+zillow2$loan_amount = round(zillow2$LoanAmount/1000)
+      
+# Set up coordinates to match with Census Data
+zdf <- as.data.table(zillow2)
+      
+      
+      
+      
+#tracts2000 <- california.tract
+# Get Census CRS projection
+census.CRS <- st_crs(tracts2000)
+
+zdf = st_as_sf(zdf, coords = c("PropertyAddressLongitude", "PropertyAddressLatitude"), agr = "constant", crs = census.CRS)
+      
+# Transform data to match CRS projection from Census data
+cord.UTM <- st_transform(zdf, census.CRS)
+
+zillow_tract <- st_join(cord.UTM, tracts2015, join = st_within)
+zillow_tract$id_number <- paste(zillow_tract$COUNTYFP, zillow_tract$TRACTCE, sep = '')
+# Add decimal to make mergeable to HMDA data
+zillow_tract$id_number <- sub("([[:digit:]]{2,2})$", ".\\1", zillow_tract$id_number)
+
+zillow3_filt = setDT(zillow_tract)[, .(n = .N), by = .(id_number,loan_amount)]
+zillow3 = merge(zillow_tract,zillow3_filt, by =c('id_number','loan_amount')) %>% filter(n == 1)
+
+hmda = tbl(hmda_database, in_schema('hmda_public','lar_2017')) %>% collect()
+
+hmda %<>% mutate(agency_code = ifelse(is.na(agency_code), '023', agency_code))
+hmda %<>% mutate(respondent_id_prop = str_c(agency_code, respondent_id, sep = ''))
+
+hmda %<>% mutate(loan_amount = as.numeric(loan_amount)) %>% mutate(LoanAmount = loan_amount*1000)
+
+# Create location identifiers to match Zillow data
+hmda$county_code <- parse_number(hmda$county_code)
+      
+hmda$county_code <- paste(formatC(hmda$county_code, width = 3, flag = "0"), sep = "")
+      
+hmda$county_code <- as.character(hmda$county_code)
+
+hmda$id_number <- paste(hmda$county_code, hmda$census_tract, sep = '')
+
+hmda <- hmda[which(hmda$id_number != 'NA'
+                         & !is.na(hmda$LoanAmount)), ]
+
+count.hmda <- setDT(hmda)[, .(n = .N), by = c('id_number', 'loan_amount')]
+      
+      
+hmda2 <- merge(hmda, count.hmda,
+                     by.x = c("id_number", "loan_amount"),
+                     by.y = c("id_number", "loan_amount"))
+      
+rm(count.hmda)
+      
+hmda2 <- hmda2[which(hmda2$n == 1), ] %>% as.data.table()
+
+merge12 = merge(zillow3, hmda2, 
+                      by.x = c("id_number", "loan_amount"),
+                      by.y = c("id_number", "loan_amount"), .keep_all = TRUE)
+
+head(merge12)
+```
+
